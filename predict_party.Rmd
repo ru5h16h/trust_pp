@@ -1,0 +1,547 @@
+---
+title: "barometer"
+author: "rushabh"
+date: "2024-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+library(brms)
+library(caret)
+library(corrplot)
+library(ggplot2)
+library(glmnet)
+library(glue)
+library(hash)
+library(haven)
+library(knitr)
+library(loo)
+library(purrr)
+
+```
+
+```{r}
+set.seed(49)
+
+```
+
+## Data Preprocessing
+
+```{r}
+ORIGINAL_DATA_PATH <- "/home/rushabh/Downloads/msci718/project/CAN_merge_2006-2023_LAPOP_AmericasBarometer_v1.0_w.sav"
+
+# Load the data from original .sav file.
+raw_data <- haven::read_sav(ORIGINAL_DATA_PATH)
+glue("Number of rows in the raw data: {nrow(raw_data)}.")
+glue("Number of columns in the raw data: {ncol(raw_data)}.")
+
+```
+
+```{r}
+# Define column descriptions
+COLUMN_DESCRIPTION <- list(
+  pn4 = "Satisfaction with democracy in your country",
+  b3 = "Basic rights are protected",
+  aoj11 = "Perception of safety in one's neighborhood",
+  b43 = "National pride",
+  b1 = "Courts guarantee fair trial",
+  b2 = "Respect for political institutions",
+  b4 = "Pride in political system",
+  b6 = "People should support the political system",
+  q10d = "Salary/household income",
+  soct1 = "Evaluation of the economic situation of the country",
+  q1 = "Gender",
+  q2 = "Age",
+  prov = "Province",
+  year = "Year",
+  canvb20 = "Party that the respondent would vote for in the next election"
+)
+
+# Define columns to select
+COLUMNS_TO_SELECT <- names(COLUMN_DESCRIPTION)
+RENAME_COLUMNS <- list(
+  pn4 = "demo_satisfaction",
+  b3 = "rights_protected",
+  aoj11 = "safety_perception",
+  b43 = "national_pride",
+  b1 = "fair_trial",
+  b2 = "political_respect",
+  b4 = "political_pride",
+  b6 = "support_political",
+  q10d = "income_cat",
+  soct1 = "economic_eval",
+  q1 = "gender",
+  q2 = "age",
+  prov = "province",
+  year = "year",
+  canvb20 = "voting_party"
+)
+
+PROVINCE_MAPPING <- hash(
+  c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+  c( "Alberta", "British Columbia", "Manitoba", "New Brunswick", "Newfoundland", "Nova Scotia", "Ontario", "Prince Edward Island", "Quebec", "Saskatchewan")
+)
+
+GENDER_MAPPING <- hash(
+  c(1, 2),
+  c( "Male", "Female")
+)
+
+PARTY_MAPPING <- hash(
+  c(1, 2, 3, 4, 5, 6),
+  c("The Liberal Party", "The Conservative Party", "The New Democratic Party", "The Bloc Québécois", "The Green Party", "The Peopleʼs Party of Canada")
+)
+
+# Define preprocessing function
+pre_process_data <- function(df) {
+  df <- df[, COLUMNS_TO_SELECT, drop = FALSE]
+  df <- na.omit(df)
+  df <- data.frame(lapply(df, as.numeric))
+  df <- df[df$q1 != 3,]
+  df$prov <- df$prov - 4100
+  df <- df[df$canvb20 <= 6, ]
+  colnames(df) <- unlist(RENAME_COLUMNS)
+  
+  label_df <- df$gender
+  label_df$province_label <- unlist(as.list(PROVINCE_MAPPING)[df$province])
+  label_df$gender_label <- unlist(as.list(GENDER_MAPPING)[df$gender])
+  label_df$voting_party_label <- unlist(as.list(PARTY_MAPPING)[df$voting_party])
+  return(list(data = df, label_data = label_df))
+}
+
+# Assuming 'data_uptd' is your updated data frame
+result <- pre_process_data(raw_data)
+data <- result$data
+label_data <- result$label_data
+
+glue("Number of rows in the processed data: {nrow(data)}.")
+glue("Number of columns in the processed data: {ncol(data)}.")
+
+```
+
+## Data Statistics and Visualization
+
+```{r}
+TARGET_VARIABLE <- "voting_party"
+
+# Calculate mean, standard deviation, min, max, and number of unique values
+summary_stats <- function(x) {
+  c(Mean = round(mean(x), 2),
+    Std_Dev = round(sd(x), 2),
+    Min = round(min(x), 2),
+    Max = round(max(x), 2),
+    Unique_Values = length(unique(x)))
+}
+summary_data <- sapply(data, summary_stats)
+
+# Convert summary_data to a data frame and transpose
+summary_data <- t(as.data.frame(summary_data, stringsAsFactors = FALSE))
+
+# Add column names
+colnames(summary_data) <- c("Mean", "Std_Dev", "Min", "Max", "Unique")
+
+# Print the summary data in a tabular format
+kable(summary_data, align = "c", caption = "Summary Statistics")
+
+```
+
+```{r}
+# Create the histogram of response variable
+ggplot(data, aes(x = voting_party)) +
+  geom_bar(fill = "skyblue", color = "black") +
+  labs(title = "Histogram of target varaible", x = "Responder's choice for voting party", y = "Frequency") +
+  theme_minimal()
+
+```
+
+```{r}
+# Get unique labels and their count
+unique_provs <- sort(unique(label_data$province_label))
+num_provs <- length(unique_provs)
+
+# Generate a palette of colors based on the number of unique labels
+color_palette <- rainbow(num_provs)
+
+# Dodged bar plot where each dodges represent the response variable and different colors represents province.
+ggplot(data, aes(x = factor(voting_party), fill = factor(province))) +
+  geom_bar(position = position_dodge(width = 0.75)) +  # Adjust dodge width as needed
+  scale_fill_manual(values = color_palette, labels = unique_provs) +
+  labs(x = "Responder's choice for voting party", y = "Count", fill = "Province") +
+  theme_minimal()
+
+```
+
+```{r}
+# Get unique labels and their count
+unique_gender <- sort(unique(label_data$gender_label))
+num_gend <- length(unique_gender)
+
+# Generate a palette of colors based on the number of unique labels
+color_palette <- rainbow(num_gend)
+
+# Dodged bar plot
+ggplot(data, aes(x = factor(voting_party), fill = factor(gender))) +
+  geom_bar(position = position_dodge(width = 0.75)) +  # Adjust dodge width as needed
+  scale_fill_manual(values = color_palette, labels = unique_gender) +
+  labs(x = "Responder's choice for voting party", y = "Count", fill = "Gender") +
+  theme_minimal()
+
+```
+
+```{r}
+# Relationship between perception of economic evaluation, category of income and response variable.
+ggplot(data, aes(x = voting_party, y = economic_eval, color = income_cat)) +
+  geom_point(position = position_jitter(width = 0.2)) +  # Adjust jitter width as needed
+  scale_x_discrete(labels = unique(label_data$voting_party)) +  # Set voting party labels
+  facet_wrap(~ income_cat) + # Create facets for satisfaction levels
+  labs(x = "Responder's choice for voting party", y = "Evaluation of economy as per responder", color = "Income Category") +
+  theme_minimal()
+
+```
+
+#### Checking the effect of moderator - income_cat
+
+```{r}
+# Define the formula for the Poisson multilevel GLM
+formulas <- list(
+  bf(voting_party ~ economic_eval, family = categorical(link =logit)),
+  bf(voting_party ~ economic_eval + income_cat, family = categorical(link =logit))
+)
+
+# Create empty lists to store models and predictions
+models_moderator <- list()
+y_true <- test_data$voting_party
+
+# Fit the model using brm for each formula
+for (idx in seq_along(formulas)) {
+  cat("Experiment Number", idx, "\n")
+  model <- brm(formulas[[idx]], data = train_data, family = categorical(link = logit))
+  models_moderator[[idx]] <- model
+  cat(rep("-", 79), "\n")
+}
+
+```
+
+```{r}
+models_moderator_uptd <- setNames(models_moderator, c("model_eco", "model_eco_income"))
+loo_results_moderator <- lapply(models_moderator_uptd, loo, reloo = TRUE)
+output <- loo_compare(loo_results_moderator)
+output
+
+```
+
+#### Correlation between variables
+
+```{r}
+cor_mat <- cor(data[, -which(names(data) == "year")])
+options(warn=-1)
+corrplot(cor_mat, type = "upper")
+
+```
+
+```{r}
+# Get the list of columns according to descending order of absolute correlation.
+target_cor = cor_mat[which(colnames(cor_mat) == "voting_party"), ]
+target_cor <- target_cor[!names(target_cor) == "voting_party"]
+sorted_cols <- names(target_cor[order(abs(target_cor), decreasing = TRUE)])
+
+```
+
+## Applying Models
+
+#### Train-test split
+
+```{r}
+TRAIN_FRAC = 0.85
+
+train_test_split <- function(df) {
+  ## 75% of the sample size
+  smp_size <- floor(TRAIN_FRAC * nrow(df))
+  train_indices <- sample(seq_len(nrow(df)), size = smp_size)
+  train_df <- df[train_indices, ]
+  test_df <- df[-train_indices, ]
+  return(list(train = train_df, test = test_df))  # Corrected return statement
+}
+
+# Call the train_test_split function and assign the results to train_data and test_data
+split_data <- train_test_split(data)
+train_data <- split_data$train
+test_data <- split_data$test
+
+glue("Length of train set: {nrow(train_data)}.")
+glue("Length of test set: {nrow(test_data)}.")
+
+```
+
+```{r}
+# Helper function for printing metrics.
+print_metric <- function(y_true, y_pred) {
+  cm = confusionMatrix(factor(y_pred), factor(y_true))
+  cat("\nConfusion Matrix:\n")
+  print(cm$table)
+  
+  f1 <- cm$byClass[, "F1"]
+  # Precision, recall, and F1 score for each class
+  metrics <- data.frame(
+    Class = rownames(cm$byClass),
+    Precision = sprintf("%.3f", cm$byClass[, "Precision"]),
+    Recall = sprintf("%.3f", cm$byClass[, "Recall"]),
+    F1_Score = sprintf("%.3f", cm$byClass[, "F1"])
+  )
+  metrics = t(metrics)
+  
+  # Print the metrics table
+  cat("\nMetrics Table:\n")
+  print(metrics)
+  
+  # Accuracy
+  accuracy <- sprintf("%.3f", cm$overall[1])
+  cat("\nAccuracy:\n")
+  print(accuracy)
+  return(mean(f1, na.rm=TRUE))
+}
+
+```
+
+### (1) Generalized Linear Model
+
+Fits the GLM with One vs. All strategy (as multinomial family is not available). Uses forward selection for searching relevant features.
+
+```{r}
+formula_glm <- "voting_party_binary ~ "
+predictions <- list()
+best_f1_macro <- 0
+y_true <- test_data$voting_party
+class_names <- unique(train_data$voting_party)
+for (idx in seq_along(sorted_cols)) {
+  cat("Experiment Number", idx, "\n")
+  if (idx == 1) {
+    cur_formula <- paste(formula_glm, sorted_cols[[idx]])
+  } else {
+    cur_formula <- paste(formula_glm, "+", sorted_cols[[idx]])
+  }
+  cat("Current Formula", cur_formula, "\n")
+  class_wise_predictions <- list()
+  for (class_name in class_names) {
+    train_data$voting_party_binary <- ifelse(train_data$voting_party == class_name, 1, 0)
+    model_glm <- glm(cur_formula, data = train_data, family = binomial)
+    class_wise_predictions[[class_name]] <- predict(model_glm, newdata = test_data, type = "response")
+  }
+  class_wise_predictions <- do.call(cbind, class_wise_predictions)
+  y_pred_glm <- apply(class_wise_predictions, 1, function(row_pred) {
+    class_names[which.max(row_pred)]
+  })
+  f1_macro <- print_metric(factor(y_true), factor(y_pred_glm))
+  cat("F1 Macro", f1_macro, "\n")
+  if (f1_macro > best_f1_macro) {
+    formula_glm <- cur_formula
+  }
+  cat("Formula at the end of iteration", formula_glm, "\n")
+  cat(rep("-", 79), "\n\n\n")
+}
+
+```
+
+### (2) GLM with Regularization
+
+Fits `glmnet` and selects best features using forward selection.
+
+```{r}
+formula_glmnet <- "voting_party ~ "
+best_f1_macro_glmnet <- 0
+y_true <- test_data$voting_party
+# Fit the model using brm for each formula
+for (idx in seq_along(sorted_cols)) {
+  cat("Experiment Number", idx, "\n")
+  if (idx == 1) {
+    cur_formula <- paste(formula_glmnet, sorted_cols[[idx]])
+  } else {
+    cur_formula <- paste(formula_glmnet, "+", sorted_cols[[idx]])
+  }
+  cat("Current Formula", cur_formula, "\n")
+  temp_train_data <- model.matrix(as.formula(cur_formula), train_data)
+  model_glmnet <- glmnet(temp_train_data, train_data$voting_party, family = "multinomial")
+  plot(model_glmnet, xvar = "lambda", label = TRUE, type.coef = "2norm")
+  
+  temp_test_data <- model.matrix(as.formula(cur_formula), test_data)
+  y_pred_glmnet <- predict(model_glmnet, s = 0.01, newx = temp_test_data, type = "class")
+  
+  f1_macro <- print_metric(factor(y_true), factor(y_pred_glmnet))
+  cat("F1 Macro", f1_macro, "\n")
+  if (f1_macro > best_f1_macro_glmnet) {
+    formula_glmnet <- cur_formula
+  }
+  cat(rep("-", 79), "\n")
+  
+  cvfit <- cv.glmnet(temp_train_data, train_data$voting_party, family = "multinomial", type.multinomial = "grouped")
+  plot(cvfit)
+}
+
+```
+
+### (3) Bayesian Methods
+
+#### Forward selection with Bayesian Estimation
+
+Fit Bayesian model using `brms` package and searches for best features using forward selection.
+
+```{r}
+formula_brm <- "voting_party ~ "
+prev_model_brm <- NULL
+predictions <- list()
+models_brms <- list()
+for (idx in seq_along(sorted_cols)) {
+  cat("Experiment Number", idx, "\n")
+  if (idx == 1) {
+    cur_formula <- paste(formula_brm, sorted_cols[[idx]])
+  } else {
+    cur_formula <- paste(formula_brm, "+", sorted_cols[[idx]])
+  }
+  cat("Current Formula", cur_formula, "\n")
+  model_brm <- brm(bf(cur_formula), data = train_data, family = categorical(link = logit))
+  if (is.null(prev_model_brm)) {
+    prev_model_brm <- model_brm
+    models_brms[[idx]] <- model_brm
+    formula_brm <- cur_formula
+    cat(rep("-", 79), "\n")
+    next
+  }
+  loo_model <- loo(model_brm)
+  loo_prev_model <- loo(prev_model_brm)
+  comparison_result <- loo_compare(loo_model, loo_prev_model)
+  cat("LOOCV comparision\n", comparison_result)
+  if (rownames(comparison_result)[[1]] == "model_brm") {
+    prev_model_brm <- model_brm
+    models_brms[[idx]] <- model_brm
+    formula_brm <- cur_formula
+  }
+  predictions[[cur_formula]] <- predict(model_brm, newdata = test_data)
+  y_pred <- apply(predictions[[cur_formula]], 1, which.max)
+  f1_macro <- print_metric(factor(y_true), factor(y_pred))
+  cat("F1 macro", f1_macro, "\n")
+  cat("Formula at the end of iteration", formula_brm, "\n")
+  cat(rep("-", 79), "\n")
+}
+
+```
+
+```{r}
+model_names <- paste0("model_brm_", seq_along(models_brms))
+models_uptd <- setNames(models_brms, model_names)
+models_uptd <- discard(models_uptd, is.null)
+loo_results <- lapply(models_uptd, loo, reloo = TRUE)
+loo_compare(loo_results)
+
+```
+
+```{r}
+# Summary for all the models.
+models_uptd
+
+```
+
+```{r}
+# Traceplot for the final model.
+plot(models_brms[[length(models_brms)]], nvariables = 2, ask = FALSE)
+
+```
+
+```{r}
+# Predictive power checking for the final model.
+pp_check(models_brms[[length(models_brms)]])
+
+```
+
+#### Forward Selection with Multilevel Modeling
+
+Uses `province` variable as random factor.
+
+```{r}
+formula_brm_hm <- "voting_party ~ (1 | province)"
+prev_model_brm_hm <- NULL
+predictions <- list()
+models_brm_hm <- list()
+for (idx in seq_along(sorted_cols)) {
+  cat("Experiment Number", idx, "\n")
+  if (sorted_cols[[idx]] == "province") {
+    next
+  }
+  cur_formula <- paste(formula_brm_hm, "+", sorted_cols[[idx]])
+  cat("Current formula", cur_formula)
+  model_brm_hm <- brm(bf(cur_formula), data = train_data, family = categorical(link = logit))
+  if (is.null(prev_model_brm_hm)) {
+    prev_model_brm_hm <- model_brm_hm
+    models_brm_hm[[idx]] <- model_brm_hm
+    formula_brm_hm <- cur_formula
+    cat(rep("-", 79), "\n")
+    next
+  }
+  loo_model <- loo(model_brm_hm)
+  loo_prev_model <- loo(prev_model_brm_hm)
+  comparison_result <- loo_compare(loo_model, loo_prev_model)
+  cat("LOOCV comparision\n", comparison_result, "\n")
+  if (rownames(comparison_result)[[1]] == "model_brm_hm") {
+    prev_model_brm_hm <- model_brm_hm
+    models_brm_hm[[idx]] <- model_brm_hm
+    formula_brm_hm <- cur_formula
+  }
+  predictions[[cur_formula]] <- predict(model_brm_hm, newdata = test_data)
+  y_pred <- apply(predictions[[cur_formula]], 1, which.max)
+  f1_macro <- print_metric(factor(y_true), factor(y_pred))
+  cat("F1 macro", f1_macro, "\n")
+  cat("Formula at the end of iteration", formula_brm, "\n")
+  cat(rep("-", 79), "\n")
+}
+
+```
+
+```{r}
+model_names_brm_hm <- paste0("model_brm-hm_", seq_along(models_brm_hm))
+models_uptd_brm_hm <- setNames(models_brm_hm, model_names_brm_hm)
+models_uptd_brm_hm <- discard(models_uptd_brm_hm, is.null)
+loo_results_brm_hm <- lapply(models_uptd_brm_hm, loo, reloo = TRUE)
+loo_compare(loo_results_brm_hm)
+
+```
+
+```{r}
+models_brm_hm
+
+```
+
+```{r}
+exp(fixef(models_brm_hm[[length(models_brm_hm)]]))
+
+```
+
+```{r}
+plot(models_brm_hm[[length(models_brm_hm)]], nvariables = 2, ask = FALSE)
+
+
+```
+
+```{r}
+pp_check(models_brm_hm[[length(models_brm_hm)]])
+
+```
+
+#### Comparison between Single-level and Multilevel Bayesian Estimation
+
+```{r}
+combined_models <- c(models_brms, models_brm_hm)
+combined_names <- c(model_names, model_names_brm_hm)
+combined_models <- setNames(combined_models, combined_names)
+combined_models <- discard(combined_models, is.null)
+combined_loo_results <- lapply(combined_models, loo, reloo = TRUE)
+cat("\n")
+comp <- loo_compare(combined_loo_results)
+cat("\n")
+print(comp)
+
+
+```
